@@ -13,6 +13,7 @@ import logging
 import concurrent.futures
 import threading
 import time
+from annoy import AnnoyIndex
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
@@ -21,17 +22,19 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Disney Pin Image Matching API", version="1.0.0")
 
 class ImageMatcher:
-    def __init__(self, database_path: str = "image_data"):
+    def __init__(self, database_path: str = "local_test_img"):
         self.database_path = database_path
         self.features_cache_file = "features_cache.pkl"
         self.metadata_cache_file = "metadata_cache.json"
+        self.annoy_index_file = "annoy_index.ann"
+        self.annoy_mapping_file = "annoy_mapping.json"
         
         # 🎯 CONFIGURAÇÕES DE PERFORMANCE - Ajuste estes valores conforme necessário
-        self.early_stop_threshold = 0.4  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
-        self.min_threshold = 0.3  # Score mínimo para considerar como candidato
-        self.max_workers = 14  # Número de threads para busca paralela
+        self.early_stop_threshold = 0.7  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
+        self.min_threshold = 0.4  # Score mínimo para considerar como candidato
+        self.max_workers = 16  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
-        self.batch_size = 50  # Tamanho do lote para processamento paralelo
+        self.batch_size = 100  # Tamanho do lote para processamento paralelo
         
         # Configuração do detector ORB
         self.orb = cv2.ORB_create(
@@ -52,9 +55,56 @@ class ImageMatcher:
         # Cache de features das imagens do banco
         self.database_features = {}
         self.database_metadata = {}
+
+        # Annoy index e mapping
+        self.annoy_index = None
+        self.annoy_mapping = {}
         
         # Carrega ou cria o banco de features
         self.load_or_create_database()
+
+    def _get_annoy_dim(self):
+        # ORB descriptors are 32-dim uint8, but we use float32 for Annoy
+        return 32
+
+    def _descriptor_to_vector(self, descriptors: np.ndarray) -> np.ndarray:
+        # Use the mean of descriptors as a single vector for the image
+        if descriptors is None or len(descriptors) == 0:
+            return np.zeros(self._get_annoy_dim(), dtype=np.float32)
+        return np.mean(descriptors.astype(np.float32), axis=0)
+
+    def build_annoy_index(self):
+        """Cria o índice Annoy a partir dos descritores médios das imagens do banco"""
+        dim = self._get_annoy_dim()
+        annoy_index = AnnoyIndex(dim, 'euclidean')
+        annoy_mapping = {}
+        idx = 0
+        for image_path, descriptors in self.database_features.items():
+            vec = self._descriptor_to_vector(descriptors)
+            annoy_index.add_item(idx, vec)
+            annoy_mapping[str(idx)] = image_path
+            idx += 1
+        if idx > 0:
+            annoy_index.build(10)  # 10 trees for good balance
+            annoy_index.save(self.annoy_index_file)
+            with open(self.annoy_mapping_file, 'w') as f:
+                json.dump(annoy_mapping, f)
+            logger.info(f"Annoy index criado com {idx} imagens.")
+        self.annoy_index = annoy_index
+        self.annoy_mapping = annoy_mapping
+
+    def load_annoy_index(self):
+        dim = self._get_annoy_dim()
+        annoy_index = AnnoyIndex(dim, 'euclidean')
+        if os.path.exists(self.annoy_index_file) and os.path.exists(self.annoy_mapping_file):
+            annoy_index.load(self.annoy_index_file)
+            with open(self.annoy_mapping_file, 'r') as f:
+                annoy_mapping = json.load(f)
+            self.annoy_index = annoy_index
+            self.annoy_mapping = annoy_mapping
+            logger.info(f"Annoy index carregado com {len(annoy_mapping)} imagens.")
+        else:
+            self.build_annoy_index()
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """Pré-processamento da imagem para melhorar a detecção de features"""
@@ -159,12 +209,14 @@ class ImageMatcher:
         
         logger.info(f"Total de imagens processadas: {processed_count}")
         self.save_cache()
+        self.build_annoy_index()
     
     def load_or_create_database(self):
         """Carrega cache existente ou processa imagens do banco"""
         if not self.load_cache():
             logger.info("Cache não encontrado. Processando imagens do banco...")
             self.process_database_images()
+        self.load_annoy_index()
     
     def calculate_similarity(self, descriptors1: np.ndarray, descriptors2: np.ndarray) -> float:
         """Calcula similaridade entre dois conjuntos de descriptors"""
@@ -200,24 +252,36 @@ class ImageMatcher:
             return 0.0
     
     def search_similar_images(self, query_image: np.ndarray, top_k: int = 5) -> List[Dict]:
-        """Busca imagens similares no banco com otimizações de performance"""
+        """Busca imagens similares usando Annoy (rápido para grandes bancos)"""
         start_time = time.time()
         query_keypoints, query_descriptors = self.extract_features(query_image)
-        
         if query_descriptors is None or len(query_descriptors) == 0:
             return []
-        
-        logger.info(f"🔍 Iniciando busca em {len(self.database_features)} imagens")
-        logger.info(f"⚡ Configurações: threshold={self.early_stop_threshold}, parallel={self.use_parallel_search}, workers={self.max_workers}")
-        
+        if self.annoy_index is not None and len(self.annoy_mapping) > 0:
+            query_vec = self._descriptor_to_vector(query_descriptors)
+            idxs, dists = self.annoy_index.get_nns_by_vector(query_vec, top_k, include_distances=True)
+            results = []
+            for idx, dist in zip(idxs, dists):
+                image_path = self.annoy_mapping.get(str(idx))
+                if image_path:
+                    similarity = 1.0 / (1.0 + dist)  # converte distância para score (quanto menor a distância, maior o score)
+                    results.append({
+                        'image_path': image_path,
+                        'similarity_score': similarity,
+                        'metadata': self.database_metadata.get(image_path, {}),
+                        'annoy_distance': dist
+                    })
+            elapsed_time = time.time() - start_time
+            logger.info(f"✅ Busca Annoy concluída em {elapsed_time:.2f}s - {len(results)} resultados encontrados")
+            return results
+        # fallback para busca tradicional
+        logger.info("Annoy index não disponível, usando busca tradicional.")
         if self.use_parallel_search:
             results = self._search_parallel(query_descriptors, top_k)
         else:
             results = self._search_sequential(query_descriptors, top_k)
-        
         elapsed_time = time.time() - start_time
         logger.info(f"✅ Busca concluída em {elapsed_time:.2f}s - {len(results)} resultados encontrados")
-        
         return results
     
     def _search_sequential(self, query_descriptors: np.ndarray, top_k: int) -> List[Dict]:
