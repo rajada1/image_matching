@@ -31,23 +31,24 @@ class ImageMatcher:
         self.annoy_index_file = "annoy_index.ann"
         self.annoy_mapping_file = "annoy_mapping.json"
         
-        # 🎯 CONFIGURAÇÕES DE PERFORMANCE - Ajuste estes valores conforme necessário
-        self.early_stop_threshold = 0.99  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
-        self.min_threshold = 0.5  # Score mínimo para considerar como candidato
+        # 🎯 CONFIGURAÇÕES DE PERFORMANCE MELHORADAS
+        self.early_stop_threshold = 0.95  # 🔧 Reduzido para encontrar bons matches mais rápido
+        self.min_threshold = 0.3  # 🔧 Reduzido para capturar mais candidatos iniciais
+        self.hybrid_threshold = 0.5  # 🔧 NOVO: Threshold específico para busca híbrida
         self.max_workers = 16  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
         self.batch_size = 100  # Tamanho do lote para processamento paralelo
         
-        # 🚀 CONFIGURAÇÕES ANNOY OTIMIZADAS
+        # 🚀 CONFIGURAÇÕES ANNOY BALANCEADAS (PRECISÃO vs MEMÓRIA)
         self.use_annoy = True  # Habilita/desabilita busca com Annoy
-        self.annoy_n_trees = 15  # 🔧 OTIMIZADO: Reduzido de 50 para 15 (menos memória)
-        self.annoy_search_k = 50  # 🔧 OTIMIZADO: Reduzido de 100 para 50 (menos busca)
+        self.annoy_n_trees = 25  # 🔧 BALANCEADO: Aumentado para melhor precisão (era 15)
+        self.annoy_search_k = 100  # 🔧 BALANCEADO: Aumentado para melhor recall (era 50)
         self.descriptor_dim = 32  # Dimensão dos descriptors ORB (sempre 32)
         self.annoy_batch_size = 10000  # Tamanho do lote para construção incremental do índice
         
-        # 🔧 CONFIGURAÇÃO ORB OTIMIZADA PARA MEMÓRIA
+        # 🔧 CONFIGURAÇÃO ORB BALANCEADA (PRECISÃO vs MEMÓRIA)
         self.orb = cv2.ORB_create(
-            nfeatures=150,  # 🔧 OTIMIZADO: Reduzido de 1000 para 150 (redução ~85% memória)
+            nfeatures=250,  # 🔧 BALANCEADO: Aumentado para melhor precisão (era 150)
             scaleFactor=1.2,
             nlevels=8,
             edgeThreshold=31,
@@ -390,7 +391,7 @@ class ImageMatcher:
             self.process_database_images()
     
     def calculate_similarity(self, descriptors1: np.ndarray, descriptors2: np.ndarray) -> float:
-        """Calcula similaridade entre dois conjuntos de descriptors"""
+        """Calcula similaridade melhorada entre dois conjuntos de descriptors"""
         if descriptors1 is None or descriptors2 is None or len(descriptors1) == 0 or len(descriptors2) == 0:
             return 0.0
         
@@ -400,23 +401,50 @@ class ImageMatcher:
             if len(matches) == 0:
                 return 0.0
             
-            # Ordena matches por distância
+            # Ordena matches por distância (melhores primeiro)
             matches = sorted(matches, key=lambda x: x.distance)
             
-            # Calcula score baseado nas melhores matches
-            good_matches = [m for m in matches if m.distance < 50]  # Threshold ajustável
+            # Filtros de qualidade progressivos
+            excellent_matches = [m for m in matches if m.distance < 25]  # Matches excelentes
+            good_matches = [m for m in matches if m.distance < 40]       # Matches bons
+            decent_matches = [m for m in matches if m.distance < 60]     # Matches decentes
             
-            # Score baseado na proporção de boas matches
-            max_features = max(len(descriptors1), len(descriptors2))
-            similarity_score = len(good_matches) / max_features
+            # Calcula métricas de qualidade
+            total_features = min(len(descriptors1), len(descriptors2))
+            excellent_ratio = len(excellent_matches) / total_features
+            good_ratio = len(good_matches) / total_features
+            decent_ratio = len(decent_matches) / total_features
             
-            # Score adicional baseado na qualidade das matches
+            # Score ponderado por qualidade das matches
+            quality_score = (
+                excellent_ratio * 1.0 +    # Peso total para matches excelentes
+                good_ratio * 0.7 +         # Peso alto para matches bons
+                decent_ratio * 0.4         # Peso moderado para matches decentes
+            ) / 3.0
+            
+            # Score baseado na distribuição de distâncias
             if len(good_matches) > 0:
                 avg_distance = sum(m.distance for m in good_matches) / len(good_matches)
-                distance_score = max(0, (100 - avg_distance) / 100)  # Normaliza distância
-                similarity_score = (similarity_score + distance_score) / 2
+                distance_score = max(0, (80 - avg_distance) / 80)  # Normaliza para 0-1
+            else:
+                distance_score = 0.0
             
-            return min(similarity_score, 1.0)
+            # Score de cobertura (quantas features foram matcheadas)
+            coverage_score = len(decent_matches) / total_features
+            
+            # Combinação final ponderada
+            final_score = (
+                quality_score * 0.5 +      # 50% qualidade das matches
+                distance_score * 0.3 +     # 30% qualidade das distâncias
+                coverage_score * 0.2       # 20% cobertura de features
+            )
+            
+            # Bonus para imagens com muitas matches excelentes
+            if excellent_ratio > 0.1:  # Mais de 10% de matches excelentes
+                excellent_bonus = min(excellent_ratio * 0.2, 0.1)  # Até 10% de bonus
+                final_score += excellent_bonus
+            
+            return min(final_score, 1.0)
             
         except Exception as e:
             logger.error(f"Erro no cálculo de similaridade: {e}")
@@ -449,81 +477,101 @@ class ImageMatcher:
         return results
     
     def _search_with_annoy(self, query_descriptors: np.ndarray, top_k: int) -> List[Dict]:
-        """Busca usando índice Annoy para aceleração"""
+        """Busca híbrida Annoy + ORB para melhor precisão"""
         if self.annoy_index is None:
             logger.warning("Índice Annoy não disponível, usando busca sequencial")
             return self._search_sequential(query_descriptors, top_k)
         
-        # Dicionário para acumular scores por imagem
+        logger.info(f"🔍 Busca híbrida: {len(query_descriptors)} descritores de consulta")
+        
+        # FASE 1: Busca Annoy para encontrar candidatos rapidamente
+        candidate_images = set()
         image_scores = {}
         
-        # Para cada descriptor da query, busca os mais similares
+        # Aumenta temporariamente o search_k para melhor recall
+        search_k_expanded = min(self.annoy_search_k * 3, 300)
+        
         for query_desc in query_descriptors:
             query_float = query_desc.astype(np.float32)
             
-            # Busca vizinhos mais próximos no índice Annoy
+            # Busca mais candidatos no Annoy
             similar_ids, distances = self.annoy_index.get_nns_by_vector(
                 query_float,
-                self.annoy_search_k,
+                search_k_expanded,
                 include_distances=True
             )
             
-            # Processa os vizinhos encontrados
+            # Coleta candidatos únicos
             for annoy_id, distance in zip(similar_ids, distances):
                 image_path = self.annoy_id_to_image.get(str(annoy_id))
                 if image_path is None:
                     continue
                 
-                # Converte distância angular para similaridade (0-1)
-                # Distância angular varia de 0 a 2, então similarity = 1 - distance/2
+                candidate_images.add(image_path)
+                
+                # Score Annoy melhorado
                 similarity = max(0, 1 - distance / 2)
                 
-                # Acumula score para esta imagem
                 if image_path not in image_scores:
                     image_scores[image_path] = {
-                        'total_similarity': 0.0,
-                        'match_count': 0,
-                        'best_similarity': 0.0
+                        'annoy_scores': [],
+                        'annoy_best': 0.0
                     }
                 
-                image_scores[image_path]['total_similarity'] += similarity
-                image_scores[image_path]['match_count'] += 1
-                image_scores[image_path]['best_similarity'] = max(
-                    image_scores[image_path]['best_similarity'],
-                    similarity
+                image_scores[image_path]['annoy_scores'].append(similarity)
+                image_scores[image_path]['annoy_best'] = max(
+                    image_scores[image_path]['annoy_best'], similarity
                 )
         
-        # Calcula score final para cada imagem
-        results = []
-        for image_path, scores in image_scores.items():
-            # Score final é uma combinação do melhor match e match médio
-            avg_similarity = scores['total_similarity'] / scores['match_count']
-            final_score = (scores['best_similarity'] * 0.7 + avg_similarity * 0.3)
+        logger.info(f"🎯 Fase 1: {len(candidate_images)} candidatos via Annoy")
+        
+        # FASE 2: Refinamento com ORB tradicional nos top candidatos
+        top_candidates = sorted(
+            candidate_images,
+            key=lambda img: image_scores[img]['annoy_best'],
+            reverse=True
+        )[:min(100, len(candidate_images))]  # Refina top 100
+        
+        logger.info(f"🔬 Fase 2: Refinando {len(top_candidates)} candidatos com ORB")
+        
+        refined_results = []
+        for image_path in top_candidates:
+            # Calcula similaridade ORB tradicional (mais precisa)
+            db_descriptors = self.database_features.get(image_path)
+            if db_descriptors is None:
+                continue
             
-            # Aplica threshold mínimo
-            if final_score >= self.min_threshold:
+            orb_similarity = self.calculate_similarity(query_descriptors, db_descriptors)
+            
+            # Score híbrido: ORB (70%) + Annoy (30%)
+            annoy_avg = sum(image_scores[image_path]['annoy_scores']) / len(image_scores[image_path]['annoy_scores'])
+            hybrid_score = orb_similarity * 0.7 + annoy_avg * 0.3
+            
+            if hybrid_score >= self.min_threshold:
                 result = {
                     'image_path': image_path,
-                    'similarity_score': final_score,
+                    'similarity_score': hybrid_score,
                     'metadata': self.database_metadata.get(image_path, {}),
                     'match_details': {
-                        'matches_found': scores['match_count'],
-                        'best_match': scores['best_similarity'],
-                        'avg_match': avg_similarity
+                        'orb_similarity': orb_similarity,
+                        'annoy_similarity': annoy_avg,
+                        'hybrid_score': hybrid_score,
+                        'annoy_matches': len(image_scores[image_path]['annoy_scores'])
                     },
-                    'search_method': 'annoy'
+                    'search_method': 'hybrid_annoy_orb'
                 }
-                results.append(result)
+                refined_results.append(result)
                 
-                # Early stopping para Annoy também
-                if final_score >= self.early_stop_threshold:
-                    logger.info(f"🚀 EARLY STOP ANNOY! Score {final_score:.3f} em '{image_path}'")
+                # Early stopping com score híbrido
+                if hybrid_score >= self.early_stop_threshold:
+                    logger.info(f"🚀 EARLY STOP HÍBRIDO! Score {hybrid_score:.3f} (ORB: {orb_similarity:.3f}) em '{image_path}'")
                     return [result]
         
-        # Ordena por score e retorna top_k
-        results.sort(key=lambda x: x['similarity_score'], reverse=True)
-        logger.info(f"🚀 Annoy encontrou {len(results)} candidatos")
-        return results[:top_k]
+        # Ordena por score híbrido
+        refined_results.sort(key=lambda x: x['similarity_score'], reverse=True)
+        logger.info(f"✅ Busca híbrida: {len(refined_results)} resultados com ORB+Annoy")
+        
+        return refined_results[:top_k]
     
     def _search_sequential(self, query_descriptors: np.ndarray, top_k: int) -> List[Dict]:
         """Busca sequencial com early stopping otimizado"""
