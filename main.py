@@ -32,17 +32,17 @@ class ImageMatcher:
         self.annoy_mapping_file = "annoy_mapping.json"
         
         # 🎯 CONFIGURAÇÕES DE PERFORMANCE MELHORADAS
-        self.early_stop_threshold = 0.95  # 🔧 Reduzido para encontrar bons matches mais rápido
-        self.min_threshold = 0.3  # 🔧 Reduzido para capturar mais candidatos iniciais
-        self.hybrid_threshold = 0.5  # 🔧 NOVO: Threshold específico para busca híbrida
+        self.early_stop_threshold = 0.98  # 🔧 Reduzido para encontrar bons matches mais rápido
+        self.min_threshold = 0.2  # 🔧 Reduzido para capturar mais candidatos iniciais
+        self.hybrid_threshold = 0.3  # 🔧 NOVO: Threshold específico para busca híbrida
         self.max_workers = 16  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
         self.batch_size = 100  # Tamanho do lote para processamento paralelo
         
         # 🚀 CONFIGURAÇÕES ANNOY BALANCEADAS (PRECISÃO vs MEMÓRIA)
         self.use_annoy = True  # Habilita/desabilita busca com Annoy
-        self.annoy_n_trees = 25  # 🔧 BALANCEADO: Aumentado para melhor precisão (era 15)
-        self.annoy_search_k = 100  # 🔧 BALANCEADO: Aumentado para melhor recall (era 50)
+        self.annoy_n_trees = 50  # 🔧 BALANCEADO: Aumentado para melhor precisão (era 15)
+        self.annoy_search_k = 200  # 🔧 BALANCEADO: Aumentado para melhor recall (era 50)
         self.descriptor_dim = 32  # Dimensão dos descriptors ORB (sempre 32)
         self.annoy_batch_size = 10000  # Tamanho do lote para construção incremental do índice
         
