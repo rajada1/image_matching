@@ -28,8 +28,8 @@ class ImageMatcher:
         
         # 🎯 CONFIGURAÇÕES DE PERFORMANCE - Ajuste estes valores conforme necessário
         self.early_stop_threshold = 0.4  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
-        self.min_threshold = 0.1  # Score mínimo para considerar como candidato
-        self.max_workers = 12  # Número de threads para busca paralela
+        self.min_threshold = 0.3  # Score mínimo para considerar como candidato
+        self.max_workers = 13  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
         self.batch_size = 100  # Tamanho do lote para processamento paralelo
         
