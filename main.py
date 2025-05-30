@@ -13,6 +13,8 @@ import logging
 import concurrent.futures
 import threading
 import time
+import psutil
+import gc
 from annoy import AnnoyIndex
 
 # Configuração de logging
@@ -36,15 +38,16 @@ class ImageMatcher:
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
         self.batch_size = 100  # Tamanho do lote para processamento paralelo
         
-        # 🚀 CONFIGURAÇÕES ANNOY
+        # 🚀 CONFIGURAÇÕES ANNOY OTIMIZADAS
         self.use_annoy = True  # Habilita/desabilita busca com Annoy
-        self.annoy_n_trees = 50  # Número de árvores do índice Annoy (mais árvores = mais precisão)
-        self.annoy_search_k = 100  # Número de nós a examinar durante busca
+        self.annoy_n_trees = 15  # 🔧 OTIMIZADO: Reduzido de 50 para 15 (menos memória)
+        self.annoy_search_k = 50  # 🔧 OTIMIZADO: Reduzido de 100 para 50 (menos busca)
         self.descriptor_dim = 32  # Dimensão dos descriptors ORB (sempre 32)
+        self.annoy_batch_size = 10000  # Tamanho do lote para construção incremental do índice
         
-        # Configuração do detector ORB
+        # 🔧 CONFIGURAÇÃO ORB OTIMIZADA PARA MEMÓRIA
         self.orb = cv2.ORB_create(
-            nfeatures=1000,  # Número máximo de features
+            nfeatures=150,  # 🔧 OTIMIZADO: Reduzido de 1000 para 150 (redução ~85% memória)
             scaleFactor=1.2,
             nlevels=8,
             edgeThreshold=31,
@@ -69,6 +72,36 @@ class ImageMatcher:
         
         # Carrega ou cria o banco de features
         self.load_or_create_database()
+    
+    def get_memory_usage(self) -> Dict:
+        """Retorna informações sobre uso de memória"""
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_percent = process.memory_percent()
+        
+        return {
+            'rss_gb': memory_info.rss / (1024**3),  # Resident Set Size in GB
+            'vms_gb': memory_info.vms / (1024**3),  # Virtual Memory Size in GB
+            'percent': memory_percent,
+            'available_gb': psutil.virtual_memory().available / (1024**3)
+        }
+    
+    def log_memory_usage(self, context: str = ""):
+        """Log do uso atual de memória"""
+        try:
+            mem = self.get_memory_usage()
+            logger.info(f"💾 Memória{' ' + context if context else ''}: "
+                       f"RSS={mem['rss_gb']:.2f}GB, "
+                       f"VMS={mem['vms_gb']:.2f}GB, "
+                       f"Uso={mem['percent']:.1f}%, "
+                       f"Disponível={mem['available_gb']:.2f}GB")
+        except Exception as e:
+            logger.warning(f"Erro ao obter info de memória: {e}")
+    
+    def cleanup_memory(self):
+        """Força limpeza de memória"""
+        gc.collect()
+        logger.info("🧹 Limpeza de memória executada")
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """Pré-processamento da imagem para melhorar a detecção de features"""
@@ -171,11 +204,27 @@ class ImageMatcher:
         return False
     
     def build_annoy_index(self):
-        """Constrói índice Annoy a partir das features do banco"""
+        """Constrói índice Annoy de forma incremental com monitoramento de memória"""
         if not self.use_annoy:
             return
             
-        logger.info("🚀 Construindo índice Annoy...")
+        logger.info("🚀 Construindo índice Annoy OTIMIZADO...")
+        self.log_memory_usage("(inicial)")
+        
+        # Estima número total de descritores
+        total_descriptors = sum(len(descriptors) for descriptors in self.database_features.values())
+        total_images = len(self.database_features)
+        
+        logger.info(f"📊 Estimativa: {total_descriptors:,} descritores de {total_images:,} imagens")
+        logger.info(f"💾 Memória estimada do índice: ~{(total_descriptors * self.descriptor_dim * 4) / (1024**3):.2f} GB")
+        
+        # Verifica se há memória suficiente
+        current_mem = self.get_memory_usage()
+        estimated_gb = (total_descriptors * self.descriptor_dim * 4) / (1024**3)
+        
+        if estimated_gb > current_mem['available_gb'] * 0.8:  # 80% da memória disponível
+            logger.warning(f"⚠️  ATENÇÃO: Memória estimada ({estimated_gb:.2f}GB) próxima do limite disponível ({current_mem['available_gb']:.2f}GB)")
+            logger.info("💡 Considere reduzir ainda mais o número de features ou processar em lotes menores")
         
         # Cria novo índice
         self.annoy_index = AnnoyIndex(self.descriptor_dim, 'angular')
@@ -183,9 +232,12 @@ class ImageMatcher:
         self.annoy_id_to_descriptor_idx = {}
         
         annoy_id = 0
-        logger.info("🚀  Adicionando Índices...")
-        # Adiciona todos os descriptors ao índice
-        for image_path, descriptors in self.database_features.items():
+        processed_descriptors = 0
+        logger.info("🚀 Adicionando descritores ao índice (processamento incremental)...")
+        
+        # Processa em lotes para monitoramento
+        for image_idx, (image_path, descriptors) in enumerate(self.database_features.items()):
+            # Adiciona todos os descriptors desta imagem
             for desc_idx, descriptor in enumerate(descriptors):
                 # Converte descriptor para float32 (requerido pelo Annoy)
                 desc_float = descriptor.astype(np.float32)
@@ -198,12 +250,36 @@ class ImageMatcher:
                 self.annoy_id_to_descriptor_idx[str(annoy_id)] = desc_idx
                 
                 annoy_id += 1
+                processed_descriptors += 1
+            
+            # Log do progresso e memória a cada lote de imagens
+            if (image_idx + 1) % 1000 == 0 or (image_idx + 1) == total_images:
+                progress_pct = ((image_idx + 1) / total_images) * 100
+                logger.info(f"📈 Progresso: {image_idx + 1:,}/{total_images:,} imagens ({progress_pct:.1f}%) - {processed_descriptors:,} descritores")
+                self.log_memory_usage(f"(após {image_idx + 1:,} imagens)")
+                
+                # Força limpeza de memória a cada 5000 imagens
+                if (image_idx + 1) % 5000 == 0:
+                    self.cleanup_memory()
 
-        # Constrói o índice (processo demorado, mas feito uma vez)
-        logger.info(f"🚀 Construindo {self.annoy_n_trees} árvores para {annoy_id} descritores...")
-        self.annoy_index.build(self.annoy_n_trees)
+        # Log memória antes da construção das árvores
+        logger.info(f"🔨 Construindo {self.annoy_n_trees} árvores para {annoy_id:,} descritores...")
+        logger.info("⏳ Este processo pode demorar alguns minutos e usar bastante memória...")
+        self.log_memory_usage("(antes da construção)")
         
-        logger.info(f"🚀 Índice Annoy construído com sucesso! Total: {annoy_id} descritores")
+        build_start = time.time()
+        self.annoy_index.build(self.annoy_n_trees)
+        build_time = time.time() - build_start
+        
+        # Log final
+        self.log_memory_usage("(após construção)")
+        self.cleanup_memory()
+        
+        logger.info(f"✅ Índice Annoy construído com sucesso!")
+        logger.info(f"📊 Total: {annoy_id:,} descritores de {total_images:,} imagens")
+        logger.info(f"⏱️  Tempo de construção: {build_time:.2f} segundos")
+        logger.info(f"🌳 Árvores construídas: {self.annoy_n_trees}")
+        logger.info(f"🔧 Otimizações aplicadas: ORB features reduzidas para {self.orb.getMaxFeatures()}")
     
     def load_cache(self) -> bool:
         """Carrega cache de features e metadata"""
@@ -230,41 +306,76 @@ class ImageMatcher:
         return False
     
     def process_database_images(self):
-        """Processa todas as imagens do banco e extrai features"""
+        """Processa todas as imagens do banco e extrai features com otimizações de memória"""
         if not os.path.exists(self.database_path):
             raise ValueError(f"Diretório do banco não encontrado: {self.database_path}")
         
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
         processed_count = 0
+        skipped_count = 0
+        total_features = 0
         
+        # Conta total de arquivos primeiro
+        all_image_files = []
         for root, dirs, files in os.walk(self.database_path):
             for file in files:
-                file_path = os.path.join(root, file)
                 file_ext = os.path.splitext(file)[1].lower()
-                
                 if file_ext in image_extensions:
-                    try:
-                        image = self.load_image(file_path)
-                        keypoints, descriptors = self.extract_features(image)
-                        
-                        if descriptors is not None and len(descriptors) > 0:
-                            relative_path = os.path.relpath(file_path, self.database_path)
-                            
-                            self.database_features[relative_path] = descriptors
-                            self.database_metadata[relative_path] = {
-                                'filename': file,
-                                'path': file_path,
-                                'features_count': len(descriptors),
-                                'image_shape': image.shape
-                            }
-                            
-                            processed_count += 1
-                            logger.info(f"Processada: {relative_path} ({len(descriptors)} features)")
-                        
-                    except Exception as e:
-                        logger.error(f"Erro ao processar {file_path}: {e}")
+                    all_image_files.append(os.path.join(root, file))
         
-        logger.info(f"Total de imagens processadas: {processed_count}")
+        total_files = len(all_image_files)
+        logger.info(f"🖼️  Encontrados {total_files:,} arquivos de imagem para processar")
+        logger.info(f"🔧 Configuração ORB: {self.orb.getMaxFeatures()} features máximas por imagem")
+        
+        # Processa imagens
+        for idx, file_path in enumerate(all_image_files):
+            try:
+                image = self.load_image(file_path)
+                keypoints, descriptors = self.extract_features(image)
+                
+                if descriptors is not None and len(descriptors) > 0:
+                    relative_path = os.path.relpath(file_path, self.database_path)
+                    
+                    self.database_features[relative_path] = descriptors
+                    self.database_metadata[relative_path] = {
+                        'filename': os.path.basename(file_path),
+                        'path': file_path,
+                        'features_count': len(descriptors),
+                        'image_shape': image.shape
+                    }
+                    
+                    processed_count += 1
+                    total_features += len(descriptors)
+                    
+                    # Log progresso a cada 100 imagens
+                    if processed_count % 100 == 0 or processed_count == 1:
+                        progress_pct = ((idx + 1) / total_files) * 100
+                        avg_features = total_features / processed_count
+                        logger.info(f"📈 Progresso: {processed_count:,}/{total_files:,} ({progress_pct:.1f}%) - Média: {avg_features:.0f} features/img")
+                else:
+                    skipped_count += 1
+                    if skipped_count <= 10:  # Log apenas as primeiras 10 falhas
+                        logger.warning(f"⚠️  Imagem sem features: {os.path.basename(file_path)}")
+                
+                # Libera memória da imagem processada
+                del image
+                if descriptors is not None:
+                    del descriptors, keypoints
+                        
+            except Exception as e:
+                skipped_count += 1
+                logger.error(f"❌ Erro ao processar {os.path.basename(file_path)}: {e}")
+        
+        # Estatísticas finais
+        avg_features_per_image = total_features / processed_count if processed_count > 0 else 0
+        estimated_memory_gb = (total_features * self.descriptor_dim * 4) / (1024**3)
+        
+        logger.info(f"✅ PROCESSAMENTO CONCLUÍDO:")
+        logger.info(f"   📊 Imagens processadas: {processed_count:,}")
+        logger.info(f"   ⚠️  Imagens ignoradas: {skipped_count:,}")
+        logger.info(f"   🔍 Total de features: {total_features:,}")
+        logger.info(f"   📈 Média de features/imagem: {avg_features_per_image:.1f}")
+        logger.info(f"   💾 Memória estimada do índice: ~{estimated_memory_gb:.2f} GB")
         
         # Constrói índice Annoy se habilitado
         if self.use_annoy and processed_count > 0:
