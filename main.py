@@ -198,8 +198,6 @@ class ImageMatcher:
                 self.annoy_id_to_descriptor_idx[str(annoy_id)] = desc_idx
                 
                 annoy_id += 1
-                logger.info(f"🚀  annoy id {annoy_id}")
-            logger.info(f"🚀  for image path {image_path}")
 
         # Constrói o índice (processo demorado, mas feito uma vez)
         logger.info(f"🚀 Construindo {self.annoy_n_trees} árvores para {annoy_id} descritores...")
