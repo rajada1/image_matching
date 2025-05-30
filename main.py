@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Disney Pin Image Matching API", version="1.0.0")
 
 class ImageMatcher:
-    def __init__(self, database_path: str = "local_test_img"):
+    def __init__(self, database_path: str = "image_data"):
         self.database_path = database_path
         self.features_cache_file = "features_cache.pkl"
         self.metadata_cache_file = "metadata_cache.json"
