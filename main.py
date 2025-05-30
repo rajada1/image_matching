@@ -30,11 +30,17 @@ class ImageMatcher:
         self.annoy_mapping_file = "annoy_mapping.json"
         
         # 🎯 CONFIGURAÇÕES DE PERFORMANCE - Ajuste estes valores conforme necessário
-        self.early_stop_threshold = 0.7  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
-        self.min_threshold = 0.4  # Score mínimo para considerar como candidato
-        self.max_workers = 16  # Número de threads para busca paralela
+        self.early_stop_threshold = 0.99  # ⚠️ THRESHOLD PRINCIPAL - Score mínimo para retorno imediato
+        self.min_threshold = 0.5  # Score mínimo para considerar como candidato
+        self.max_workers = 14  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
-        self.batch_size = 100  # Tamanho do lote para processamento paralelo
+        self.batch_size = 50  # Tamanho do lote para processamento paralelo
+        
+        # 🚀 CONFIGURAÇÕES ANNOY
+        self.use_annoy = True  # Habilita/desabilita busca com Annoy
+        self.annoy_n_trees = 50  # Número de árvores do índice Annoy (mais árvores = mais precisão)
+        self.annoy_search_k = 100  # Número de nós a examinar durante busca
+        self.descriptor_dim = 32  # Dimensão dos descriptors ORB (sempre 32)
         
         # Configuração do detector ORB
         self.orb = cv2.ORB_create(
@@ -55,56 +61,14 @@ class ImageMatcher:
         # Cache de features das imagens do banco
         self.database_features = {}
         self.database_metadata = {}
-
-        # Annoy index e mapping
+        
+        # 🚀 Annoy - Índice e mapeamentos
         self.annoy_index = None
-        self.annoy_mapping = {}
+        self.annoy_id_to_image = {}  # Mapeia ID do Annoy para caminho da imagem
+        self.annoy_id_to_descriptor_idx = {}  # Mapeia ID do Annoy para índice do descriptor
         
         # Carrega ou cria o banco de features
         self.load_or_create_database()
-
-    def _get_annoy_dim(self):
-        # ORB descriptors are 32-dim uint8, but we use float32 for Annoy
-        return 32
-
-    def _descriptor_to_vector(self, descriptors: np.ndarray) -> np.ndarray:
-        # Use the mean of descriptors as a single vector for the image
-        if descriptors is None or len(descriptors) == 0:
-            return np.zeros(self._get_annoy_dim(), dtype=np.float32)
-        return np.mean(descriptors.astype(np.float32), axis=0)
-
-    def build_annoy_index(self):
-        """Cria o índice Annoy a partir dos descritores médios das imagens do banco"""
-        dim = self._get_annoy_dim()
-        annoy_index = AnnoyIndex(dim, 'euclidean')
-        annoy_mapping = {}
-        idx = 0
-        for image_path, descriptors in self.database_features.items():
-            vec = self._descriptor_to_vector(descriptors)
-            annoy_index.add_item(idx, vec)
-            annoy_mapping[str(idx)] = image_path
-            idx += 1
-        if idx > 0:
-            annoy_index.build(10)  # 10 trees for good balance
-            annoy_index.save(self.annoy_index_file)
-            with open(self.annoy_mapping_file, 'w') as f:
-                json.dump(annoy_mapping, f)
-            logger.info(f"Annoy index criado com {idx} imagens.")
-        self.annoy_index = annoy_index
-        self.annoy_mapping = annoy_mapping
-
-    def load_annoy_index(self):
-        dim = self._get_annoy_dim()
-        annoy_index = AnnoyIndex(dim, 'euclidean')
-        if os.path.exists(self.annoy_index_file) and os.path.exists(self.annoy_mapping_file):
-            annoy_index.load(self.annoy_index_file)
-            with open(self.annoy_mapping_file, 'r') as f:
-                annoy_mapping = json.load(f)
-            self.annoy_index = annoy_index
-            self.annoy_mapping = annoy_mapping
-            logger.info(f"Annoy index carregado com {len(annoy_mapping)} imagens.")
-        else:
-            self.build_annoy_index()
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """Pré-processamento da imagem para melhorar a detecção de features"""
@@ -154,6 +118,94 @@ class ImageMatcher:
             json.dump(self.database_metadata, f, indent=2)
         
         logger.info(f"Cache salvo com {len(self.database_features)} imagens")
+        
+        # Salva índice Annoy se habilitado
+        if self.use_annoy and self.annoy_index is not None:
+            self.save_annoy_index()
+    
+    def save_annoy_index(self):
+        """Salva índice Annoy e mapeamentos"""
+        try:
+            # Salva o índice
+            self.annoy_index.save(self.annoy_index_file)
+            
+            # Salva os mapeamentos
+            annoy_mapping = {
+                'id_to_image': self.annoy_id_to_image,
+                'id_to_descriptor_idx': self.annoy_id_to_descriptor_idx,
+                'n_trees': self.annoy_n_trees,
+                'descriptor_dim': self.descriptor_dim
+            }
+            
+            with open(self.annoy_mapping_file, 'w') as f:
+                json.dump(annoy_mapping, f, indent=2)
+            
+            logger.info(f"🚀 Índice Annoy salvo com {len(self.annoy_id_to_image)} descritores")
+            
+        except Exception as e:
+            logger.error(f"Erro ao salvar índice Annoy: {e}")
+    
+    def load_annoy_index(self) -> bool:
+        """Carrega índice Annoy e mapeamentos"""
+        try:
+            if (os.path.exists(self.annoy_index_file) and
+                os.path.exists(self.annoy_mapping_file)):
+                
+                # Carrega mapeamentos
+                with open(self.annoy_mapping_file, 'r') as f:
+                    annoy_mapping = json.load(f)
+                
+                self.annoy_id_to_image = annoy_mapping['id_to_image']
+                self.annoy_id_to_descriptor_idx = annoy_mapping['id_to_descriptor_idx']
+                
+                # Cria e carrega índice
+                self.annoy_index = AnnoyIndex(self.descriptor_dim, 'angular')
+                self.annoy_index.load(self.annoy_index_file)
+                
+                logger.info(f"🚀 Índice Annoy carregado com {len(self.annoy_id_to_image)} descritores")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"Erro ao carregar índice Annoy: {e}")
+        
+        return False
+    
+    def build_annoy_index(self):
+        """Constrói índice Annoy a partir das features do banco"""
+        if not self.use_annoy:
+            return
+            
+        logger.info("🚀 Construindo índice Annoy...")
+        
+        # Cria novo índice
+        self.annoy_index = AnnoyIndex(self.descriptor_dim, 'angular')
+        self.annoy_id_to_image = {}
+        self.annoy_id_to_descriptor_idx = {}
+        
+        annoy_id = 0
+        logger.info("🚀  Adicionando Índices...")
+        # Adiciona todos os descriptors ao índice
+        for image_path, descriptors in self.database_features.items():
+            for desc_idx, descriptor in enumerate(descriptors):
+                # Converte descriptor para float32 (requerido pelo Annoy)
+                desc_float = descriptor.astype(np.float32)
+                
+                # Adiciona ao índice
+                self.annoy_index.add_item(annoy_id, desc_float)
+                
+                # Salva mapeamentos
+                self.annoy_id_to_image[str(annoy_id)] = image_path
+                self.annoy_id_to_descriptor_idx[str(annoy_id)] = desc_idx
+                
+                annoy_id += 1
+                logger.info(f"🚀  annoy id {annoy_id}")
+            logger.info(f"🚀  for image path {image_path}")
+
+        # Constrói o índice (processo demorado, mas feito uma vez)
+        logger.info(f"🚀 Construindo {self.annoy_n_trees} árvores para {annoy_id} descritores...")
+        self.annoy_index.build(self.annoy_n_trees)
+        
+        logger.info(f"🚀 Índice Annoy construído com sucesso! Total: {annoy_id} descritores")
     
     def load_cache(self) -> bool:
         """Carrega cache de features e metadata"""
@@ -166,6 +218,13 @@ class ImageMatcher:
                     self.database_metadata = json.load(f)
                 
                 logger.info(f"Cache carregado com {len(self.database_features)} imagens")
+                
+                # Tenta carregar índice Annoy
+                if self.use_annoy:
+                    if not self.load_annoy_index():
+                        logger.info("Índice Annoy não encontrado, será construído...")
+                        self.build_annoy_index()
+                
                 return True
         except Exception as e:
             logger.warning(f"Erro ao carregar cache: {e}")
@@ -208,15 +267,18 @@ class ImageMatcher:
                         logger.error(f"Erro ao processar {file_path}: {e}")
         
         logger.info(f"Total de imagens processadas: {processed_count}")
+        
+        # Constrói índice Annoy se habilitado
+        if self.use_annoy and processed_count > 0:
+            self.build_annoy_index()
+        
         self.save_cache()
-        self.build_annoy_index()
     
     def load_or_create_database(self):
         """Carrega cache existente ou processa imagens do banco"""
         if not self.load_cache():
             logger.info("Cache não encontrado. Processando imagens do banco...")
             self.process_database_images()
-        self.load_annoy_index()
     
     def calculate_similarity(self, descriptors1: np.ndarray, descriptors2: np.ndarray) -> float:
         """Calcula similaridade entre dois conjuntos de descriptors"""
@@ -252,37 +314,107 @@ class ImageMatcher:
             return 0.0
     
     def search_similar_images(self, query_image: np.ndarray, top_k: int = 5) -> List[Dict]:
-        """Busca imagens similares usando Annoy (rápido para grandes bancos)"""
+        """Busca imagens similares no banco com otimizações de performance"""
         start_time = time.time()
         query_keypoints, query_descriptors = self.extract_features(query_image)
+        
         if query_descriptors is None or len(query_descriptors) == 0:
             return []
-        if self.annoy_index is not None and len(self.annoy_mapping) > 0:
-            query_vec = self._descriptor_to_vector(query_descriptors)
-            idxs, dists = self.annoy_index.get_nns_by_vector(query_vec, top_k, include_distances=True)
-            results = []
-            for idx, dist in zip(idxs, dists):
-                image_path = self.annoy_mapping.get(str(idx))
-                if image_path:
-                    similarity = 1.0 / (1.0 + dist)  # converte distância para score (quanto menor a distância, maior o score)
-                    results.append({
-                        'image_path': image_path,
-                        'similarity_score': similarity,
-                        'metadata': self.database_metadata.get(image_path, {}),
-                        'annoy_distance': dist
-                    })
-            elapsed_time = time.time() - start_time
-            logger.info(f"✅ Busca Annoy concluída em {elapsed_time:.2f}s - {len(results)} resultados encontrados")
-            return results
-        # fallback para busca tradicional
-        logger.info("Annoy index não disponível, usando busca tradicional.")
-        if self.use_parallel_search:
+        
+        logger.info(f"🔍 Iniciando busca em {len(self.database_features)} imagens")
+        
+        # 🚀 Escolhe método de busca
+        if self.use_annoy and self.annoy_index is not None:
+            logger.info(f"🚀 Usando busca Annoy (search_k={self.annoy_search_k})")
+            results = self._search_with_annoy(query_descriptors, top_k)
+        elif self.use_parallel_search:
+            logger.info(f"⚡ Usando busca paralela (workers={self.max_workers})")
             results = self._search_parallel(query_descriptors, top_k)
         else:
+            logger.info("🔄 Usando busca sequencial")
             results = self._search_sequential(query_descriptors, top_k)
+        
         elapsed_time = time.time() - start_time
         logger.info(f"✅ Busca concluída em {elapsed_time:.2f}s - {len(results)} resultados encontrados")
+        
         return results
+    
+    def _search_with_annoy(self, query_descriptors: np.ndarray, top_k: int) -> List[Dict]:
+        """Busca usando índice Annoy para aceleração"""
+        if self.annoy_index is None:
+            logger.warning("Índice Annoy não disponível, usando busca sequencial")
+            return self._search_sequential(query_descriptors, top_k)
+        
+        # Dicionário para acumular scores por imagem
+        image_scores = {}
+        
+        # Para cada descriptor da query, busca os mais similares
+        for query_desc in query_descriptors:
+            query_float = query_desc.astype(np.float32)
+            
+            # Busca vizinhos mais próximos no índice Annoy
+            similar_ids, distances = self.annoy_index.get_nns_by_vector(
+                query_float,
+                self.annoy_search_k,
+                include_distances=True
+            )
+            
+            # Processa os vizinhos encontrados
+            for annoy_id, distance in zip(similar_ids, distances):
+                image_path = self.annoy_id_to_image.get(str(annoy_id))
+                if image_path is None:
+                    continue
+                
+                # Converte distância angular para similaridade (0-1)
+                # Distância angular varia de 0 a 2, então similarity = 1 - distance/2
+                similarity = max(0, 1 - distance / 2)
+                
+                # Acumula score para esta imagem
+                if image_path not in image_scores:
+                    image_scores[image_path] = {
+                        'total_similarity': 0.0,
+                        'match_count': 0,
+                        'best_similarity': 0.0
+                    }
+                
+                image_scores[image_path]['total_similarity'] += similarity
+                image_scores[image_path]['match_count'] += 1
+                image_scores[image_path]['best_similarity'] = max(
+                    image_scores[image_path]['best_similarity'],
+                    similarity
+                )
+        
+        # Calcula score final para cada imagem
+        results = []
+        for image_path, scores in image_scores.items():
+            # Score final é uma combinação do melhor match e match médio
+            avg_similarity = scores['total_similarity'] / scores['match_count']
+            final_score = (scores['best_similarity'] * 0.7 + avg_similarity * 0.3)
+            
+            # Aplica threshold mínimo
+            if final_score >= self.min_threshold:
+                result = {
+                    'image_path': image_path,
+                    'similarity_score': final_score,
+                    'metadata': self.database_metadata.get(image_path, {}),
+                    'match_details': {
+                        'matches_found': scores['match_count'],
+                        'best_match': scores['best_similarity'],
+                        'avg_match': avg_similarity
+                    },
+                    'search_method': 'annoy'
+                }
+                results.append(result)
+                
+                # Early stopping para Annoy também
+                if final_score >= self.early_stop_threshold:
+                    logger.info(f"🚀 EARLY STOP ANNOY! Score {final_score:.3f} em '{image_path}'")
+                    return [result]
+        
+        # Ordena por score e retorna top_k
+        results.sort(key=lambda x: x['similarity_score'], reverse=True)
+        logger.info(f"🚀 Annoy encontrou {len(results)} candidatos")
+        return results[:top_k]
     
     def _search_sequential(self, query_descriptors: np.ndarray, top_k: int) -> List[Dict]:
         """Busca sequencial com early stopping otimizado"""
@@ -402,21 +534,33 @@ matcher = ImageMatcher()
 
 @app.get("/")
 async def root():
+    annoy_status = "habilitado" if matcher.use_annoy else "desabilitado"
+    annoy_loaded = matcher.annoy_index is not None if matcher.use_annoy else False
+    
     return {
-        "message": "Disney Pin Image Matching API - OTIMIZADA ⚡",
+        "message": "Disney Pin Image Matching API - OTIMIZADA com Annoy 🚀",
         "database_size": len(matcher.database_features),
         "performance_config": {
             "early_stop_threshold": matcher.early_stop_threshold,
             "parallel_search": matcher.use_parallel_search,
-            "max_workers": matcher.max_workers
+            "max_workers": matcher.max_workers,
+            "annoy_enabled": matcher.use_annoy,
+            "annoy_loaded": annoy_loaded
+        },
+        "annoy_info": {
+            "status": annoy_status,
+            "n_trees": matcher.annoy_n_trees,
+            "search_k": matcher.annoy_search_k,
+            "total_descriptors": len(matcher.annoy_id_to_image) if annoy_loaded else 0
         },
         "endpoints": {
-            "/search": "POST - Busca imagens similares (com early stopping)",
+            "/search": "POST - Busca imagens similares (Annoy/early stopping)",
             "/searchtest": "POST - Retorna apenas a imagem com maior similaridade",
             "/database/info": "GET - Informações do banco",
             "/database/rebuild": "POST - Reconstrói cache do banco",
             "/performance/config": "GET - Visualiza configurações de performance",
-            "/performance/config": "POST - Atualiza configurações de performance"
+            "/performance/config": "POST - Atualiza configurações de performance",
+            "/annoy/rebuild": "POST - Reconstrói índice Annoy"
         }
     }
 
@@ -442,10 +586,32 @@ async def rebuild_database():
         matcher.process_database_images()
         return {
             "message": "Banco reconstruído com sucesso",
-            "total_images": len(matcher.database_features)
+            "total_images": len(matcher.database_features),
+            "annoy_rebuilt": matcher.use_annoy and matcher.annoy_index is not None
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao reconstruir banco: {str(e)}")
+
+@app.post("/annoy/rebuild")
+async def rebuild_annoy_index():
+    """Reconstrói apenas o índice Annoy"""
+    if not matcher.use_annoy:
+        raise HTTPException(status_code=400, detail="Annoy está desabilitado")
+    
+    if len(matcher.database_features) == 0:
+        raise HTTPException(status_code=400, detail="Nenhuma feature no banco. Execute /database/rebuild primeiro")
+    
+    try:
+        matcher.build_annoy_index()
+        matcher.save_annoy_index()
+        
+        return {
+            "message": "Índice Annoy reconstruído com sucesso",
+            "total_descriptors": len(matcher.annoy_id_to_image),
+            "n_trees": matcher.annoy_n_trees
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao reconstruir índice Annoy: {str(e)}")
 
 @app.get("/performance/config")
 async def get_performance_config():
@@ -456,7 +622,14 @@ async def get_performance_config():
         "max_workers": matcher.max_workers,
         "use_parallel_search": matcher.use_parallel_search,
         "batch_size": matcher.batch_size,
-        "database_size": len(matcher.database_features)
+        "database_size": len(matcher.database_features),
+        "annoy_config": {
+            "use_annoy": matcher.use_annoy,
+            "n_trees": matcher.annoy_n_trees,
+            "search_k": matcher.annoy_search_k,
+            "index_loaded": matcher.annoy_index is not None,
+            "total_descriptors": len(matcher.annoy_id_to_image) if matcher.annoy_index else 0
+        }
     }
 
 @app.post("/performance/config")
@@ -465,7 +638,9 @@ async def update_performance_config(
     min_threshold: float = None,
     max_workers: int = None,
     use_parallel_search: bool = None,
-    batch_size: int = None
+    batch_size: int = None,
+    use_annoy: bool = None,
+    annoy_search_k: int = None
 ):
     """Atualiza configurações de performance em tempo real"""
     updated = {}
@@ -502,6 +677,17 @@ async def update_performance_config(
         else:
             raise HTTPException(status_code=400, detail="batch_size deve estar entre 10 e 200")
     
+    if use_annoy is not None:
+        matcher.use_annoy = use_annoy
+        updated["use_annoy"] = use_annoy
+    
+    if annoy_search_k is not None:
+        if 10 <= annoy_search_k <= 1000:
+            matcher.annoy_search_k = annoy_search_k
+            updated["annoy_search_k"] = annoy_search_k
+        else:
+            raise HTTPException(status_code=400, detail="annoy_search_k deve estar entre 10 e 1000")
+    
     return {
         "message": "Configurações atualizadas com sucesso",
         "updated": updated,
@@ -510,7 +696,9 @@ async def update_performance_config(
             "min_threshold": matcher.min_threshold,
             "max_workers": matcher.max_workers,
             "use_parallel_search": matcher.use_parallel_search,
-            "batch_size": matcher.batch_size
+            "batch_size": matcher.batch_size,
+            "use_annoy": matcher.use_annoy,
+            "annoy_search_k": matcher.annoy_search_k
         }
     }
 
