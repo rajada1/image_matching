@@ -31,7 +31,7 @@ class ImageMatcher:
         self.min_threshold = 0.3  # Score mínimo para considerar como candidato
         self.max_workers = 14  # Número de threads para busca paralela
         self.use_parallel_search = True  # Habilita/desabilita busca paralela
-        self.batch_size = 1000  # Tamanho do lote para processamento paralelo
+        self.batch_size = 50  # Tamanho do lote para processamento paralelo
         
         # Configuração do detector ORB
         self.orb = cv2.ORB_create(
